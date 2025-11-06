@@ -1,0 +1,46 @@
+CREATE OR REPLACE FUNCTION public.fuel_used_by_shifts_r1(peqmt integer, pstartdate date, pstartshift integer, penddate date, pendshift integer)
+ RETURNS numeric
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    start_time TIMESTAMP;
+    end_time   TIMESTAMP;
+    fuel_used  NUMERIC;
+BEGIN
+    -- 1️⃣ Определяем границы смен
+    SELECT shiftstart INTO start_time
+    FROM shifts
+    WHERE shiftdate = pstartdate AND shift = pstartshift;
+
+    SELECT shiftstart + INTERVAL '12 hours' INTO end_time
+    FROM shifts
+    WHERE shiftdate = penddate AND shift = pendshift;
+
+    -- 2️⃣ Вычисляем расход на сглаженных данных
+    WITH smoothed AS (
+        SELECT
+            date_trunc('minute', to_timestamp(time_created / 1000.0))::timestamp(0)
+                - make_interval(mins => EXTRACT(MINUTE FROM to_timestamp(time_created / 1000.0))::int % 10)
+                AS m10,
+            AVG(liters) AS avg_liters
+        FROM history_fuel
+        WHERE eqmt = peqmt
+          AND to_timestamp(time_created / 1000.0)
+              BETWEEN start_time AND end_time
+        GROUP BY 1
+        ORDER BY 1
+    ),
+    bounds AS (
+        SELECT
+            (ARRAY_AGG(avg_liters ORDER BY m10 ASC))[1]  AS first_liters,
+            (ARRAY_AGG(avg_liters ORDER BY m10 DESC))[1] AS last_liters
+        FROM smoothed
+    )
+    SELECT (first_liters - last_liters)
+    INTO fuel_used
+    FROM bounds;
+
+    RETURN fuel_used;
+END;
+$function$
+;

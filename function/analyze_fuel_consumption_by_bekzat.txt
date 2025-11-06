@@ -1,0 +1,108 @@
+CREATE OR REPLACE FUNCTION public.analyze_fuel_consumption_by_bekzat(peqmt integer, pstartdate date, pstartshift integer, penddate date, pendshift integer)
+ RETURNS fuel_analytics_result_by_bekzat
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    start_ts TIMESTAMP;
+    end_ts TIMESTAMP;
+    end_shift_start_ts TIMESTAMP;
+    duration_hours NUMERIC;
+    fuel_record RECORD;
+    last_liters NUMERIC;
+    segment_start_level NUMERIC;
+    is_first_record BOOLEAN := TRUE;
+    
+    ANOMALY_THRESHOLD_LITERS NUMERIC := 100;
+    
+    -- Это отфильтрует мелкие колебания ("шум").
+    REFILL_SENSITIVITY_LITERS NUMERIC := 40;
+
+    result_data public.fuel_analytics_result_by_bekzat;
+BEGIN
+    -- 1. Инициализация
+    result_data.total_consumption_liters := 0;
+    result_data.total_refilled_liters := 0;
+    result_data.refills_count := 0;
+    result_data.anomalous_drops_count := 0;
+    -- ... (остальная инициализация без изменений) ...
+    result_data.avg_consumption_lph := 0;
+    result_data.start_fuel_level := NULL;
+    result_data.end_fuel_level := NULL;
+    result_data.data_points_processed := 0;
+
+    -- 2. Определение временных границ
+    SELECT shiftstart INTO start_ts FROM shifts WHERE shiftdate = pstartdate AND shift = pstartshift;
+    IF NOT FOUND THEN RETURN result_data; END IF;
+    SELECT shiftstart INTO end_shift_start_ts FROM shifts WHERE shiftdate = penddate AND shift = pendshift;
+    IF NOT FOUND THEN RETURN result_data; END IF;
+    SELECT MIN(shiftstart) INTO end_ts FROM shifts WHERE shiftstart > end_shift_start_ts;
+    IF end_ts IS NULL THEN
+        end_ts := end_shift_start_ts + INTERVAL '12 hours';
+    END IF;
+
+    -- 3. Основной цикл
+    FOR fuel_record IN
+        SELECT liters FROM history_fuel
+        WHERE eqmt = peqmt
+          AND to_timestamp(time_created / 1000.0) >= start_ts
+          AND to_timestamp(time_created / 1000.0) < end_ts
+        ORDER BY time_created ASC
+    LOOP
+        result_data.data_points_processed := result_data.data_points_processed + 1;
+
+        IF is_first_record THEN
+            result_data.start_fuel_level := fuel_record.liters;
+            last_liters := fuel_record.liters;
+            segment_start_level := fuel_record.liters;
+            is_first_record := FALSE;
+            CONTINUE;
+        END IF;
+
+        DECLARE
+            -- Для удобства считаем прирост (будет отрицательным при расходе)
+            increase NUMERIC := fuel_record.liters - last_liters;
+        BEGIN
+            IF increase > REFILL_SENSITIVITY_LITERS THEN -- Если это подтвержденная заправка, а не шум
+                -- Закрываем предыдущий сегмент расхода
+                result_data.total_consumption_liters := result_data.total_consumption_liters + (segment_start_level - last_liters);
+                
+                -- Собираем статистику
+                result_data.total_refilled_liters := result_data.total_refilled_liters + increase;
+                result_data.refills_count := result_data.refills_count + 1;
+                
+                -- Начинаем новый сегмент
+                segment_start_level := fuel_record.liters;
+            
+            ELSIF increase < 0 THEN -- Если это расход
+                DECLARE
+                    drop_amount NUMERIC := -increase;
+                BEGIN
+                    IF drop_amount > ANOMALY_THRESHOLD_LITERS THEN
+                        result_data.anomalous_drops_count := result_data.anomalous_drops_count + 1;
+                    END IF;
+                END;
+            END IF;
+            -- Если 'increase' между 0 и 'REFILL_SENSITIVITY_LITERS', мы его игнорируем, но last_liters все равно обновляем
+        END;
+
+        last_liters := fuel_record.liters;
+    END LOOP;
+
+    -- 4. Закрытие последнего сегмента
+    IF NOT is_first_record THEN
+        IF segment_start_level > last_liters THEN
+             result_data.total_consumption_liters := result_data.total_consumption_liters + (segment_start_level - last_liters);
+        END IF;
+        result_data.end_fuel_level := last_liters;
+    END IF;
+
+    -- 5. Расчет производных метрик
+    duration_hours := EXTRACT(EPOCH FROM (end_ts - start_ts)) / 3600.0;
+    IF duration_hours > 0 AND result_data.total_consumption_liters > 0 THEN
+        result_data.avg_consumption_lph := result_data.total_consumption_liters / duration_hours;
+    END IF;
+
+    RETURN result_data;
+END;
+$function$
+;
